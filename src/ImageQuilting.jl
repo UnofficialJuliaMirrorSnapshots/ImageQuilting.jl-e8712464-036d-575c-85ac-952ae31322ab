@@ -19,21 +19,21 @@ using SparseArrays: spzeros
 using Random: shuffle!, randperm
 using Statistics: mean, std
 
-# GeoStats.jl interface
-using GeoStatsBase
-using GeoStatsDevTools
-import GeoStatsBase: preprocess, solve_single
-
 include("utils.jl")
+include("distances.jl")
 include("plot_recipes.jl")
 include("imfilter_cpu.jl")
 include("relaxation.jl")
 include("tau_model.jl")
-include("boykov_kolmogorov_cut.jl")
+include("graphcuts.jl")
 include("voxel_reuse.jl")
 include("iqsim.jl")
 
-include("geostats_api.jl")
+# optionally load GeoStats.jl API
+using Requires
+function __init__()
+    @require GeoStatsBase="323cb8eb-fbf6-51c0-afd0-f8fba70507b2" include("geostats.jl")
+end
 
 export
   # functions

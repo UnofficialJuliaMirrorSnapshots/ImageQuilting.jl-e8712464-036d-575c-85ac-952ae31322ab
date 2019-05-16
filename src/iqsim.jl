@@ -99,12 +99,15 @@ function iqsim(trainimg::AbstractArray{T,N}, tilesize::Dims{N},
   # training image dimensions
   TIsize = size(trainimg)
 
+  # distance matrix size
+  distsize = TIsize .- tilesize .+ 1
+
   # total overlap volume in simulation grid
   ovlvol = prod(padsize) - prod(@. padsize - (ntiles - 1)*ovlsize)
 
   # geometric configuration
   geoconfig = (ntiles=ntiles, tilesize=tilesize, ovlsize=ovlsize, spacing=spacing,
-               TIsize=TIsize, simsize=simsize, padsize=padsize)
+               TIsize=TIsize, simsize=simsize, padsize=padsize, distsize=distsize)
 
   # pad input images and knockout inactive voxels
   TI, SOFT = preprocess_images(trainimg, soft, geoconfig)
@@ -128,13 +131,14 @@ function iqsim(trainimg::AbstractArray{T,N}, tilesize::Dims{N},
   boundarycuts = Vector{Array{Float64,N}}()
   voxelreuse   = Vector{Float64}()
 
-  # preallocate memory whenever possible
-  distance = Array{Float64}(undef, TIsize .- tilesize .+ 1)
-  cutmask  = Array{Bool}(undef, tilesize)
+  # preallocate memory
+  cutmask   = Array{Bool}(undef, tilesize)
+  ovldist   = Array{Float64}(undef, distsize)
+  softdists = [Array{Float64}(undef, distsize) for i in 1:length(soft)]
   if !isempty(hard)
-    harddist = Array{Float64}(undef, TIsize .- tilesize .+ 1)
-    harddev  = Array{Float64}(undef, tilesize)
     hardmask = Array{Bool}(undef, tilesize)
+    harddev  = Array{Float64}(undef, tilesize)
+    harddist = Array{Float64}(undef, distsize)
   end
 
   for real in 1:nreal
@@ -161,50 +165,46 @@ function iqsim(trainimg::AbstractArray{T,N}, tilesize::Dims{N},
       # current simulation dataevent
       simdev = view(simgrid, tile)
 
-      # compute overlap distance
-      overlap_distance!(distance, TI, simdev, tileind, pasted, geoconfig)
+      # overlap distance
+      overlap_distance!(ovldist, TI, simdev, tileind, pasted, geoconfig)
+      ovldist[disabled] .= Inf
 
-      # disable dataevents that contain inactive voxels
-      distance[disabled] .= Inf
-
-      # compute hard and soft distances
-      auxdistances = Vector{Array{Float64,N}}()
+      # hard distance
+      hardtile = false
       if !isempty(hard)
-        # update indicator variable for tile
         indicator!(hardmask, hard, tile)
         if any(hardmask)
-          # update hard data event
           event!(harddev, hard, tile)
-          D = convdist(TI, harddev, weights=hardmask)
-
-          # disable dataevents that contain inactive voxels
-          D[disabled] .= Inf
-
-          # swap overlap and hard distances
-          push!(auxdistances, distance)
-          distance = D
+          hard_distance!(harddist, TI, harddev, hardmask)
+          harddist[disabled] .= Inf
+          hardtile = true
         end
       end
-      for (AUX, AUXTI) in SOFT
+
+      # soft distance
+      for s in eachindex(SOFT)
+        AUX, AUXTI = SOFT[s]
         softdev = view(AUX, tile)
-        D = convdist(AUXTI, softdev)
+        soft_distance!(softdists[s], AUXTI, softdev)
+        softdists[s][disabled] .= Inf
+      end
 
-        # disable dataevents that contain inactive voxels
-        D[disabled] .= Inf
-
-        push!(auxdistances, D)
+      # main and auxiliary distances
+      if hardtile
+        D, Ds = harddist, [ovldist, softdists...]
+      else
+        D, Ds = ovldist, softdists
       end
 
       # current pattern database
-      patterndb = isempty(auxdistances) ? findall(vec(distance .≤ (1+tol)minimum(distance))) :
-                                          relaxation(distance, auxdistances, tol)
+      patterndb = isempty(Ds) ? findall(vec(D .≤ (1+tol)minimum(D))) : relaxation(D, Ds, tol)
 
       # pattern probability
-      patternprobs = tau_model(patterndb, distance, auxdistances)
+      patternprobs = tau_model(patterndb, D, Ds)
 
       # pick a pattern at random from the database
-      rind = sample(patterndb, weights(patternprobs))
-      start  = lin2cart(size(distance), rind)
+      rind   = sample(patterndb, weights(patternprobs))
+      start  = lin2cart(size(D), rind)
       finish = @. start.I + tilesize - 1
       rtile  = CartesianIndex(start):CartesianIndex(finish)
 
@@ -212,28 +212,7 @@ function iqsim(trainimg::AbstractArray{T,N}, tilesize::Dims{N},
       TIdev = view(TI, rtile)
 
       # boundary cut mask
-      cutmask .= false
-      for d=1:N
-        # Cartesian index of previous and next tiles along dimension
-        prev = CartesianIndex(ntuple(i -> i == d ? (tileind[d]-1) : tileind[i], N))
-        next = CartesianIndex(ntuple(i -> i == d ? (tileind[d]+1) : tileind[i], N))
-
-        # compute mask with previous tile
-        if ovlsize[d] > 1 && prev ∈ pasted
-          oslice = ntuple(i -> i == d ? (1:ovlsize[d]) : (1:tilesize[i]), N)
-          inds = CartesianIndices(oslice)
-          A = view(simdev, inds); B = view(TIdev, inds)
-          cutmask[inds] .|= boykov_kolmogorov_cut(A, B, d)
-        end
-
-        # compute mask with next tile
-        if ovlsize[d] > 1 && next ∈ pasted
-          oslice = ntuple(i -> i == d ? (spacing[d]+1:tilesize[d]) : (1:tilesize[i]), N)
-          inds = CartesianIndices(oslice)
-          A = view(simdev, inds); B = view(TIdev, inds)
-          cutmask[inds] .|= reverse(boykov_kolmogorov_cut(reverse(A, dims=d), reverse(B, dims=d), d), dims=d)
-        end
-      end
+      cut!(cutmask, simdev, TIdev, tileind, pasted, geoconfig)
 
       # paste quilted pattern from training image
       simdev[.!cutmask] = TIdev[.!cutmask]
@@ -273,123 +252,4 @@ function iqsim(trainimg::AbstractArray{T,N}, tilesize::Dims{N},
   end
 
   debug ? (realizations, boundarycuts, voxelreuse) : realizations
-end
-
-function preprocess_images(trainimg::AbstractArray{T,N}, soft::AbstractVector,
-                           geoconfig::NamedTuple) where {T,N}
-  padsize = geoconfig.padsize
-
-  # training image
-  TI = Float64.(trainimg)
-  TI[isnan.(TI)] .= 0
-
-  # soft data
-  SOFT = map(soft) do (aux, auxTI)
-    auxpad = padsize .- min.(padsize, size(aux))
-
-    AUX = padarray(aux, Pad(:symmetric, ntuple(i->0, N), auxpad))
-    AUX = parent(AUX)
-
-    AUXTI = Float64.(auxTI)
-
-    AUX[isnan.(AUX)] .= 0
-    AUXTI[isnan.(AUXTI)] .= 0
-
-    AUX, AUXTI
-  end
-
-  TI, SOFT
-end
-
-function find_disabled(trainimg::AbstractArray{T,N}, geoconfig::NamedTuple) where {T,N}
-  TIsize = geoconfig.TIsize
-  tilesize = geoconfig.tilesize
-
-  disabled = falses(TIsize .- tilesize .+ 1)
-  for ind in findall(isnan, trainimg)
-    start  = @. max(ind.I - tilesize + 1, 1)
-    finish = @. min(ind.I, TIsize - tilesize + 1)
-    tile   = CartesianIndex(start):CartesianIndex(finish)
-    disabled[tile] .= true
-  end
-
-  disabled
-end
-
-function find_skipped(hard::Dict, geoconfig::NamedTuple)
-  ntiles = geoconfig.ntiles
-  tilesize = geoconfig.tilesize
-  spacing = geoconfig.spacing
-  simsize = geoconfig.simsize
-
-  skipped = Set{Int}()
-  datainds = Vector{Int}()
-  for tileind in CartesianIndices(ntiles)
-    # tile corners are given by start and finish
-    start  = @. (tileind.I - 1)*spacing + 1
-    finish = @. start + tilesize - 1
-    tile   = CartesianIndex(start):CartesianIndex(finish)
-
-    # skip tile if either
-    #   1) tile is beyond true simulation size
-    #   2) all values in the tile are NaN
-    if any(start .> simsize) || !any(activation(hard, tile))
-      push!(skipped, cart2lin(ntiles, tileind))
-    elseif any(indicator(hard, tile))
-      push!(datainds, cart2lin(ntiles, tileind))
-    end
-  end
-
-  skipped, datainds
-end
-
-function overlap_distance!(distance::AbstractArray{T,N},
-                           TI::AbstractArray{T,N}, simdev::AbstractArray{T,N},
-                           tileind::CartesianIndex{N}, pasted::Set{CartesianIndex{N}},
-                           geoconfig::NamedTuple) where {N,T<:Real}
-  TIsize = geoconfig.TIsize
-  tilesize = geoconfig.tilesize
-  ovlsize = geoconfig.ovlsize
-  spacing = geoconfig.spacing
-
-  distance .= 0
-  for d=1:N
-    # Cartesian index of previous and next tiles along dimension
-    prev = CartesianIndex(ntuple(i -> i == d ? (tileind[d]-1) : tileind[i], N))
-    next = CartesianIndex(ntuple(i -> i == d ? (tileind[d]+1) : tileind[i], N))
-
-    # compute overlap distance with previous tile
-    if ovlsize[d] > 1 && prev ∈ pasted
-      oslice = ntuple(i -> i == d ? (1:ovlsize[d]) : (1:tilesize[i]), N)
-      ovl = view(simdev, CartesianIndices(oslice))
-
-      D = convdist(TI, ovl)
-
-      ax = axes(D)
-      dslice = ntuple(i -> i == d ? (1:TIsize[d]-tilesize[d]+1) : ax[i], N)
-      distance .+= view(D, CartesianIndices(dslice))
-    end
-
-    # compute overlap distance with next tile
-    if ovlsize[d] > 1 && next ∈ pasted
-      oslice = ntuple(i -> i == d ? (spacing[d]+1:tilesize[d]) : (1:tilesize[i]), N)
-      ovl = view(simdev, CartesianIndices(oslice))
-
-      D = convdist(TI, ovl)
-
-      ax = axes(D)
-      dslice = ntuple(i -> i == d ? (spacing[d]+1:TIsize[d]-ovlsize[d]+1) : ax[i], N)
-      distance .+= view(D, CartesianIndices(dslice))
-    end
-  end
-end
-
-function hard_distance!(harddist::AbstractArray{T,N},
-                        TI::AbstractArray{T,N},
-                        harddev::AbstractArray{T,N},
-                        hardmask::AbstractArray{Bool,N}) where {N,T<:Real}
-  harddist .= 0
-  if any(hardmask)
-    harddist .= convdist(TI, harddev, weights=hardmask)
-  end
 end
